@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""
+Mini SIEM Log Analyzer for Linux auth.log
+
+This script parses a standard Linux auth.log file to detect:
+1. SSH Brute-Force Attacks (High volume of failed logins from a single IP).
+2. Successful logins immediately following brute-force attempts.
+3. Persistence mechanisms (Creation of new user accounts).
+4. Privilege Escalation / Execution (Suspicious sudo commands, specifically downloads).
+
+Usage:
+    python3 mini_siem.py -f /var/log/auth.log
+    python3 mini_siem.py --file auth.log --threshold 20
+"""
+
+import argparse
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+# --- Configuration Constants ---
+DEFAULT_BRUTE_FORCE_THRESHOLD = 5
+SUSPICIOUS_SUDO_PATTERNS = ['wget', 'curl', 'nc', 'bash -i', 'python -c']
+
+# --- Data Classes for Structured Logging ---
+
+@dataclass
+class FailedLogin:
+    timestamp: str
+    username: str
+    ip_address: str
+
+@dataclass
+class SuccessfulLogin:
+    timestamp: str
+    username: str
+    ip_address: str
+
+@dataclass
+class UserCreation:
+    timestamp: str
+    creator: str
+    new_user: str
+
+@dataclass
+class SudoCommand:
+    timestamp: str
+    user: str
+    command: str
+
+@dataclass
+class AnalysisReport:
+    failed_logins: List[FailedLogin] = field(default_factory=list)
+    successful_logins: List[SuccessfulLogin] = field(default_factory=list)
+    user_creations: List[UserCreation] = field(default_factory=list)
+    sudo_commands: List[SudoCommand] = field(default_factory=list)
+
+# --- Log Parser Engine ---
+
+class AuthLogParser:
+    """Parses auth.log lines into structured security events."""
+
+    # Compiled Regex Patterns for performance
+    RE_FAILED_SSH = re.compile(
+        r'(?P<timestamp>\w{3}\s+\d+\s\d+:\d+:\d+).*sshd.*Failed password for (?:invalid user )?(?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)'
+    )
+    RE_SUCCESS_SSH = re.compile(
+        r'(?P<timestamp>\w{3}\s+\d+\s\d+:\d+:\d+).*sshd.*Accepted password for (?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)'
+    )
+    RE_USER_ADD = re.compile(
+        r'(?P<timestamp>\w{3}\s+\d+\s\d+:\d+:\d+).*useradd\[\d+\]: new user: name=(?P<new_user>\S+), UID=\d+, GID=\d+, home=\S+, shell=\S+, from=(?P<creator>\S+)'
+    )
+    # Note: auth.log typically logs the user executing sudo, not the command directly 
+    # unless sudo logging is configured to log commands. We look for the generic sudo execution.
+    RE_SUDO_CMD = re.compile(
+        r'(?P<timestamp>\w{3}\s+\d+\s\d+:\d+:\d+).*sudo:\s+(?P<user>\S+)\s+.*COMMAND=(?P<cmd>.*)'
+    )
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.report = AnalysisReport()
+
+    def parse(self) -> AnalysisReport:
+        """Reads the log file line by line and extracts relevant events."""
+        try:
+            with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as log_file:
+                for line in log_file:
+                    self._process_line(line.strip())
+        except FileNotFoundError:
+            print(f"[-] Error: The file {self.file_path} was not found.")
+            sys.exit(1)
+        except PermissionError:
+            print(f"[-] Error: Permission denied when trying to read {self.file_path}.")
+            sys.exit(1)
+        
+        return self.report
+
+    def _process_line(self, line: str) -> None:
+        """Matches a single log line against known attack signatures."""
+        
+        if failed_match := self.RE_FAILED_SSH.search(line):
+            self.report.failed_logins.append(
+                FailedLogin(
+                    timestamp=failed_match.group('timestamp'),
+                    username=failed_match.group('user'),
+                    ip_address=failed_match.group('ip')
+                )
+            )
+
+        elif success_match := self.RE_SUCCESS_SSH.search(line):
+            self.report.successful_logins.append(
+                SuccessfulLogin(
+                    timestamp=success_match.group('timestamp'),
+                    username=success_match.group('user'),
+                    ip_address=success_match.group('ip')
+                )
+            )
+
+        elif user_add_match := self.RE_USER_ADD.search(line):
+            self.report.user_creations.append(
+                UserCreation(
+                    timestamp=user_add_match.group('timestamp'),
+                    creator=user_add_match.group('creator'),
+                    new_user=user_add_match.group('new_user')
+                )
+            )
+
+        elif sudo_match := self.RE_SUDO_CMD.search(line):
+            self.report.sudo_commands.append(
+                SudoCommand(
+                    timestamp=sudo_match.group('timestamp'),
+                    user=sudo_match.group('user'),
+                    command=sudo_match.group('cmd')
+                )
+            )
+
+# --- Threat Intelligence & Correlation Engine ---
+
+class ThreatAnalyzer:
+    """Analyzes parsed logs to identify attack patterns and correlations."""
+
+    def __init__(self, report: AnalysisReport, brute_force_threshold: int):
+        self.report = report
+        self.threshold = brute_force_threshold
+
+    def analyze(self) -> None:
+        """Executes all analysis modules and prints the report."""
+        print("\n" + "="*60)
+        print(" " * 15 + "MINI SIEM ANALYSIS REPORT")
+        print("="*60)
+
+        self._analyze_brute_force()
+        self._analyze_persistence()
+        self._analyze_privilege_escalation()
+        
+        print("="*60 + "\n")
+
+    def _analyze_brute_force(self) -> None:
+        """Correlates failed and successful logins to detect brute-force success."""
+        print("\n[*] Analyzing SSH Brute-Force Attempts...")
+        
+        # Tally failed attempts by IP
+        failed_counts: Dict[str, int] = defaultdict(int)
+        for fail in self.report.failed_logins:
+            failed_counts[fail.ip_address] += 1
+
+        if not failed_counts:
+            print("    [+] No failed SSH login attempts detected.")
+            return
+
+        brute_forcers = [ip for ip, count in failed_counts.items() if count >= self.threshold]
+
+        for ip in brute_forcers:
+            print(f"    [!] ALERT: Brute-Force Detected from IP: {ip}")
+            print(f"        Total Failed Attempts: {failed_counts[ip]}")
+            
+            # Check if this IP successfully logged in
+            successful_from_ip = [s for s in self.report.successful_logins if s.ip_address == ip]
+            
+            if successful_from_ip:
+                for success in successful_from_ip:
+                    print(f"        [!!] CRITICAL: Brute-Force SUCCESSFUL!")
+                    print(f"            User Compromised: {success.username}")
+                    print(f"            Login Timestamp:  {success.timestamp}")
+            else:
+                print("        [+] No successful logins from this IP following the brute force.")
+
+    def _analyze_persistence(self) -> None:
+        """Detects the creation of new user accounts."""
+        print("\n[*] Analyzing Persistence Mechanisms (User Creation)...")
+        
+        if not self.report.user_creations:
+            print("    [+] No new user accounts created during log timeframe.")
+            return
+
+        for creation in self.report.user_creations:
+            print(f"    [!] WARNING: New User Account Created")
+            print(f"        New User:    {creation.new_user}")
+            print(f"        Created By:  {creation.creator}")
+            print(f"        Timestamp:   {creation.timestamp}")
+
+    def _analyze_privilege_escalation(self) -> None:
+        """Identifies suspicious sudo commands, specifically script downloads."""
+        print("\n[*] Analyzing Privilege Escalation & Suspicious Executions...")
+        
+        if not self.report.sudo_commands:
+            print("    [+] No sudo commands logged in this timeframe.")
+            return
+
+        suspicious_found = False
+        for cmd in self.report.sudo_commands:
+            # Check if command contains suspicious download patterns
+            if any(pattern in cmd.command.lower() for pattern in SUSPICIOUS_SUDO_PATTERNS):
+                suspicious_found = True
+                print(f"    [!] ALERT: Suspicious Sudo Command Executed")
+                print(f"        Executing User: {cmd.user}")
+                print(f"        Timestamp:      {cmd.timestamp}")
+                print(f"        Command:        {cmd.command}")
+        
+        if not suspicious_found:
+            print(f"    [+] {len(self.report.sudo_commands)} sudo commands logged, none matched suspicious download patterns.")
+
+# --- Main Execution Block ---
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Mini SIEM Log Analyzer for Linux auth.log.",
+        epilog="Example: python3 mini_siem.py -f /var/log/auth.log --threshold 10"
+    )
+    parser.add_argument(
+        "-f", "--file", 
+        required=True, 
+        help="Path to the auth.log file to analyze."
+    )
+    parser.add_argument(
+        "-t", "--threshold", 
+        type=int, 
+        default=DEFAULT_BRUTE_FORCE_THRESHOLD,
+        help=f"Threshold of failed logins to trigger brute-force alert (default: {DEFAULT_BRUTE_FORCE_THRESHOLD})."
+    )
+    
+    args = parser.parse_args()
+
+    # 1. Parse Logs
+    log_parser = AuthLogParser(args.file)
+    parsed_report = log_parser.parse()
+
+    # 2. Analyze and Correlate
+    analyzer = ThreatAnalyzer(parsed_report, args.threshold)
+    analyzer.analyze()
+
+if __name__ == "__main__":
+    main()
